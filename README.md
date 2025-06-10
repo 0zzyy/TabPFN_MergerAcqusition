@@ -17,3 +17,12 @@ Designed to run on macOS M1 Air (8 GB RAM) as of 2025-06-04.
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+
+##Usage
+python src/main.py \
+  --input-csv "/path/to/Model Training Data.csv" \
+  --output-cache "cache_light_rq" \
+  --seed 42 \
+  --smote-sample-size 2000 \
+  --top-k 10 \
+  --tabpfn-time 10

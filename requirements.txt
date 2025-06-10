@@ -1,0 +1,8 @@
+numpy
+pandas
+scikit-learn
+imbalanced-learn
+tabpfn>=2.0
+shap
+dcurves
+joblib

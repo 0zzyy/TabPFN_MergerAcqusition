@@ -1,0 +1,618 @@
+##Example
+#!/usr/bin/env python3
+"""
+answering RQ1 and RQ2 with:
+ • Tuned baselines (LR, RF, GB, SVM, MLP)
+ • TabPFN (max_time=10s)
+ • SHAP for each model (1 background + 1 test sample)
+ • Decision Curve Analysis (DCA) for all models (NOT USED HERE)
+
+Designed to run on an M1 Air (8 GB RAM) as of 2025‐06‐04.
+"""
+
+import os
+import sys
+import time
+import warnings
+import logging
+import pathlib
+import traceback
+
+import numpy as np
+import pandas as pd
+from joblib import dump, load
+
+# scikit‐learn imports
+from sklearn.model_selection import (
+    train_test_split,
+    RandomizedSearchCV,
+    StratifiedKFold,
+)
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.svm import SVC
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import (
+    roc_auc_score,
+    f1_score,
+    brier_score_loss,
+)
+from sklearn.exceptions import ConvergenceWarning
+
+# imbalanced‐learn
+from imblearn.over_sampling import SMOTE
+
+# TabPFN (v2.x)
+from tabpfn import TabPFNClassifier  # Requires: pip install tabpfn
+
+# SHAP (unified Explainer API)
+import shap
+
+# Decision Curve Analysis
+from dcurves import dca
+
+# -------------------------------------------------------------------
+# CONFIGURATION
+# -------------------------------------------------------------------
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger(__name__)
+
+SEED = 42
+TOP_K = 10
+SMOTE_SAMPLE_SIZE = 2000
+CPU_JOBS = -1
+
+# TabPFN settings
+AUTO_MAX_SEC = 10  # seconds
+
+# SHAP settings: 1 background + 1 test sample per model
+SHAP_BG_K   = 1
+SHAP_SUBSET = 1
+
+# Calibration
+ECE_BINS = 10
+
+# Paths (adjust if needed)
+BASE_DIR = pathlib.Path(__file__).resolve().parent
+DATA_DIR = pathlib.Path("/Users/alexsmacbook/Documents")
+INPUT_CSV = DATA_DIR / "Model Training Data.xlsx - full data.csv"
+
+CACHE = BASE_DIR / "cache_light_rq"
+CACHE.mkdir(exist_ok=True)
+AUTO_PKL = CACHE / "tabpfn_rq.joblib"
+
+# -------------------------------------------------------------------
+# UTILITIES
+# -------------------------------------------------------------------
+def compute_ece(y_true, y_prob, n_bins=ECE_BINS):
+    """Expected Calibration Error with n_bins."""
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    # Clip and replace NaN with 0.5
+    y_prob = np.nan_to_num(np.clip(y_prob, 0, 1), nan=0.5)
+
+    bin_edges = np.linspace(0, 1, n_bins + 1)
+    ece = 0.0
+    for i in range(n_bins):
+        lower, upper = bin_edges[i], bin_edges[i + 1]
+        in_bin = (y_prob > lower) & (y_prob <= upper)
+        prop = np.mean(in_bin)
+        if prop > 0:
+            acc = np.mean(y_true[in_bin])
+            conf = np.mean(y_prob[in_bin])
+            ece += np.abs(conf - acc) * prop
+    return ece
+
+def summarize_calibration(name, y_true, y_prob):
+    """Compute & log Brier score and ECE for a model."""
+    brier = brier_score_loss(y_true, y_prob)
+    ece = compute_ece(y_true, y_prob, n_bins=ECE_BINS)
+    log.info(f"{name} → Brier: {brier:.4f}, ECE: {ece:.4f}")
+    return brier, ece
+
+# -------------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------------
+def main():
+    t_start = time.time()
+    np.random.seed(SEED)
+
+    log.info("=== RQ1–RQ2 LIGHT PIPELINE START ===")
+
+    # 1) Load data
+    log.info("1) Loading data")
+    if not INPUT_CSV.exists():
+        log.error(f"Input CSV not found: {INPUT_CSV}")
+        sys.exit(1)
+
+    try:
+        df = pd.read_csv(INPUT_CSV, index_col=0)
+    except Exception:
+        df = pd.read_csv(INPUT_CSV)
+
+    if "status" not in df.columns:
+        log.error("Target 'status' not found")
+        sys.exit(1)
+    y = df["status"].astype(int)
+
+    # Drop unused columns
+    drop_cols = [
+        "status", "target_id", "acquirer_id",
+        "announcement_date", "exit_date", "target_naics_code",
+    ]
+    X = df.drop(columns=[c for c in drop_cols if c in df.columns])
+
+    # One‐hot encode 'attitude' if present
+    if "attitude" in X.columns:
+        log.info("One‐hot encoding 'attitude'")
+        enc = OneHotEncoder(sparse_output=False, handle_unknown="ignore")
+        att_enc = enc.fit_transform(X[["attitude"]])
+        att_cols = enc.get_feature_names_out(["attitude"])
+        att_df = pd.DataFrame(att_enc, columns=att_cols, index=X.index)
+        X = X.drop(columns=["attitude"])
+        X = pd.concat([X, att_df], axis=1)
+
+    # Fill NaNs in numeric
+    num_cols = X.select_dtypes(include=np.number).columns
+    for col in num_cols:
+        if X[col].isnull().any():
+            X[col].fillna(X[col].median(), inplace=True)
+    X.fillna(0, inplace=True)
+
+    log.info(f"Data loaded: X.shape={X.shape}, y.shape={y.shape}")
+
+    # 2) Train/Val/Test split (70/15/15)
+    log.info("2) Train/Val/Test split (70/15/15)")
+    X_train_full, X_temp, y_train_full, y_temp = train_test_split(
+        X, y, test_size=0.30, stratify=y, random_state=SEED
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_temp, y_temp, test_size=0.50, stratify=y_temp, random_state=SEED
+    )
+    log.info(f"Train={len(X_train_full)}, Val={len(X_val)}, Test={len(X_test)}")
+
+    # 3) SMOTE + top‐K feature selection
+    log.info("3) SMOTE + top‐K feature selection")
+    if len(X_train_full) > SMOTE_SAMPLE_SIZE:
+        X_sm_sub, _, y_sm_sub, _ = train_test_split(
+            X_train_full, y_train_full,
+            train_size=SMOTE_SAMPLE_SIZE,
+            stratify=y_train_full,
+            random_state=SEED,
+        )
+    else:
+        X_sm_sub, y_sm_sub = X_train_full, y_train_full
+
+    sm = SMOTE(random_state=SEED)
+    Xr_arr, yr = sm.fit_resample(X_sm_sub, y_sm_sub)
+    Xr_df = pd.DataFrame(Xr_arr, columns=X_sm_sub.columns)
+
+    # RF for pruning
+    rf_prune = RandomForestClassifier(n_estimators=50, random_state=SEED, n_jobs=CPU_JOBS)
+    rf_prune.fit(Xr_df, yr)
+    imp = pd.Series(rf_prune.feature_importances_, index=Xr_df.columns)
+    top_feats = imp.nlargest(TOP_K).index.tolist()
+    log.info(f"Top {TOP_K} features: {top_feats}")
+
+    # Create pruned datasets
+    X_train_p = X_train_full[top_feats]
+    X_val_p   = X_val[top_feats]
+    X_test_p  = X_test[top_feats]
+    Xr_p      = Xr_df[top_feats]
+
+    # 4) Train & evaluate tuned baselines
+    log.info("4) Training & evaluating tuned baselines (LR, RF, GB, SVM, MLP)")
+    scaler = StandardScaler()
+    Xr_p_scaled      = scaler.fit_transform(Xr_p)
+    X_train_p_scaled = scaler.transform(X_train_p)
+    X_test_p_scaled  = scaler.transform(X_test_p)
+
+    models_def = {
+        "LR": LogisticRegression(solver="liblinear", random_state=SEED, max_iter=500),
+        "RF": RandomForestClassifier(random_state=SEED, n_jobs=CPU_JOBS),
+        "GB": GradientBoostingClassifier(random_state=SEED),
+        "SVM": SVC(kernel="rbf", probability=True, random_state=SEED),
+        "MLP": MLPClassifier(
+            max_iter=200,
+            tol=1e-4,
+            early_stopping=True,
+            random_state=SEED,
+            hidden_layer_sizes=(50,),
+        ),
+    }
+
+    param_grids = {
+        "LR": {"C": [0.1, 1], "penalty": ["l2"]},
+        "RF": {"n_estimators": [50], "max_depth": [None, 5], "min_samples_split": [2]},
+        "GB": {"n_estimators": [50], "max_depth": [3], "learning_rate": [0.1]},
+        "SVM": {"C": [0.1, 1], "gamma": ["scale"]},
+        "MLP": {"alpha": [1e-3], "learning_rate_init": [1e-3]},
+    }
+
+    baseline_perf = {}
+    fitted_models = {}
+
+    yr_np = yr.values if isinstance(yr, pd.Series) else np.asarray(yr)
+
+    for name, mdl in models_def.items():
+        log.info(f"  → {name}: tuning")
+        search = RandomizedSearchCV(
+            estimator=mdl,
+            param_distributions=param_grids[name],
+            n_iter=2,
+            cv=StratifiedKFold(2, shuffle=True, random_state=SEED),
+            scoring="roc_auc",
+            random_state=SEED,
+            n_jobs=1,
+            error_score="raise",
+        )
+        try:
+            search.fit(Xr_p_scaled, yr_np)
+            best_m = search.best_estimator_
+            fitted_models[name] = best_m
+
+            y_prob = best_m.predict_proba(X_test_p_scaled)[:, 1]
+            auc    = roc_auc_score(y_test, y_prob)
+            f1     = f1_score(y_test, (y_prob > 0.5).astype(int))
+            baseline_perf[name] = {"AUC": auc, "F1": f1}
+            log.info(f"    {name} → AUC: {auc:.4f}, F1: {f1:.4f}")
+            summarize_calibration(name, y_test, y_prob)
+        except Exception as e:
+            log.error(f"    {name} failed: {e}")
+            traceback.print_exc()
+            fitted_models[name] = None
+            baseline_perf[name] = {"AUC": np.nan, "F1": np.nan}
+
+    # 5) Train & evaluate TabPFN
+    log.info("5) Training TabPFN (max_time=10s)")
+    tabpfn_model = None
+    if AUTO_PKL.exists():
+        try:
+            tabpfn_model = load(AUTO_PKL)
+            log.info("Loaded cached TabPFN")
+        except Exception:
+            tabpfn_model = None
+
+    if tabpfn_model is None:
+        try:
+            tabpfn_model = TabPFNClassifier(
+                device="cpu",
+                max_time=AUTO_MAX_SEC,
+            )
+            tabpfn_model.fit(
+                Xr_p.values.astype(np.float32),
+                yr.values.astype(np.int64)
+            )
+            dump(tabpfn_model, AUTO_PKL)
+            log.info("TabPFN trained & cached")
+        except Exception as e:
+            log.error(f"TabPFN train failed: {e}")
+            traceback.print_exc()
+            tabpfn_model = None
+
+    if tabpfn_model:
+        y_prob_tp = tabpfn_model.predict_proba(
+            X_test_p.values.astype(np.float32)
+        )[:, 1]
+        auc_tp = roc_auc_score(y_test, y_prob_tp)
+        f1_tp  = f1_score(y_test, (y_prob_tp > 0.5).astype(int))
+        baseline_perf["TabPFN"] = {"AUC": auc_tp, "F1": f1_tp}
+        log.info(f"    TabPFN → AUC: {auc_tp:.4f}, F1: {f1_tp:.4f}")
+        summarize_calibration("TabPFN", y_test, y_prob_tp)
+    else:
+        baseline_perf["TabPFN"] = {"AUC": np.nan, "F1": np.nan}
+
+    # 6) RQ2: SHAP for each model (1 background + 1 test sample)
+    log.info("6) RQ2: SHAP feature importances for each model (1 sample each)")
+    bg       = Xr_p.sample(n=SHAP_BG_K, random_state=SEED).reset_index(drop=True)
+    test_sub = X_test_p.iloc[:SHAP_SUBSET].reset_index(drop=True)
+
+    all_shap_importances = {}
+
+    # Helper: extract a 1D array of shap values per feature
+    def extract_shap_values(shap_vals):
+        """
+        shap_vals may be:
+          - an Explanation object with .values
+          - a list [array_class0, array_class1]
+          - a single numpy array
+        Return 1D array of length n_features.
+        """
+        try:
+            if hasattr(shap_vals, "values"):
+                arr = shap_vals.values
+            else:
+                arr = shap_vals
+
+            if isinstance(arr, list):
+                # Multi‐class: shape for each class: (n_samples, n_features)
+                arr = arr[1]  # take positive‐class for binary
+            if isinstance(arr, np.ndarray):
+                # If arr is (1, n_features) or (n_samples, n_features)
+                if arr.ndim == 2 and arr.shape[0] == 1:
+                    arr = arr[0]
+                # If arr is (n_samples, n_features, n_classes)
+                if arr.ndim == 3:
+                    arr = arr[..., 1]  # positive‐class across samples
+                    if arr.ndim == 2 and arr.shape[0] == 1:
+                        arr = arr[0]
+            return arr
+        except Exception:
+            return None
+
+    # 6.1) LR: shap.Explainer (Linear)
+    try:
+        lr_model = fitted_models.get("LR")
+        if lr_model is not None:
+            log.info("  → Explaining LR with shap.Explainer")
+            expl_lr = shap.Explainer(lr_model, bg)
+            shap_out_lr = expl_lr(test_sub)
+            arr_lr = extract_shap_values(shap_out_lr)
+            if arr_lr is not None and arr_lr.shape == (len(test_sub), len(test_sub.columns)):
+                arr_lr = arr_lr[0]  # one sample
+            if arr_lr is not None and arr_lr.ndim == 1:
+                imp_lr = pd.Series(np.abs(arr_lr), index=test_sub.columns).sort_values(ascending=False)
+                all_shap_importances["LR"] = imp_lr
+            else:
+                log.warning("    LR SHAP returned unexpected shape; skipping")
+        else:
+            log.warning("    LR not fitted; skipping SHAP for LR")
+    except Exception as e:
+        log.error(f"    LR SHAP failed: {e}")
+        traceback.print_exc()
+
+    # 6.2) RF: shap.Explainer (Tree)
+    try:
+        rf_model = fitted_models.get("RF")
+        if rf_model is not None:
+            log.info("  → Explaining RF with shap.Explainer")
+            expl_rf = shap.Explainer(rf_model, bg)
+            shap_out_rf = expl_rf(test_sub)
+            arr_rf = extract_shap_values(shap_out_rf)
+            if arr_rf is not None and arr_rf.shape == (len(test_sub), len(test_sub.columns)):
+                arr_rf = arr_rf[0]
+            if arr_rf is not None and arr_rf.ndim == 1:
+                imp_rf = pd.Series(np.abs(arr_rf), index=test_sub.columns).sort_values(ascending=False)
+                all_shap_importances["RF"] = imp_rf
+            else:
+                log.warning("    RF SHAP returned unexpected shape; skipping")
+        else:
+            log.warning("    RF not fitted; skipping SHAP for RF")
+    except Exception as e:
+        log.error(f"    RF SHAP failed: {e}")
+        traceback.print_exc()
+
+    # 6.3) GB: shap.Explainer (Tree)
+    try:
+        gb_model = fitted_models.get("GB")
+        if gb_model is not None:
+            log.info("  → Explaining GB with shap.Explainer")
+            expl_gb = shap.Explainer(gb_model, bg)
+            shap_out_gb = expl_gb(test_sub)
+            arr_gb = extract_shap_values(shap_out_gb)
+            if arr_gb is not None and arr_gb.shape == (len(test_sub), len(test_sub.columns)):
+                arr_gb = arr_gb[0]
+            if arr_gb is not None and arr_gb.ndim == 1:
+                imp_gb = pd.Series(np.abs(arr_gb), index=test_sub.columns).sort_values(ascending=False)
+                all_shap_importances["GB"] = imp_gb
+            else:
+                log.warning("    GB SHAP returned unexpected shape; skipping")
+        else:
+            log.warning("    GB not fitted; skipping SHAP for GB")
+    except Exception as e:
+        log.error(f"    GB SHAP failed: {e}")
+        traceback.print_exc()
+
+    # 6.4) SVM: shap.Explainer (Kernel)
+    try:
+        svm_model = fitted_models.get("SVM")
+        if svm_model is not None:
+            log.info("  → Explaining SVM with shap.Explainer")
+            expl_svm = shap.Explainer(lambda X: svm_model.predict_proba(X), bg)
+            shap_out_svm = expl_svm(test_sub)
+            arr_svm = extract_shap_values(shap_out_svm)
+            if arr_svm is not None and arr_svm.shape == (len(test_sub), len(test_sub.columns)):
+                arr_svm = arr_svm[0]
+            if arr_svm is not None and arr_svm.ndim == 1:
+                imp_svm = pd.Series(np.abs(arr_svm), index=test_sub.columns).sort_values(ascending=False)
+                all_shap_importances["SVM"] = imp_svm
+            else:
+                log.warning("    SVM SHAP returned unexpected shape; skipping")
+        else:
+            log.warning("    SVM not fitted; skipping SHAP for SVM")
+    except Exception as e:
+        log.error(f"    SVM SHAP failed: {e}")
+        traceback.print_exc()
+
+    # 6.5) MLP: shap.Explainer (Kernel)
+    try:
+        mlp_model = fitted_models.get("MLP")
+        if mlp_model is not None:
+            log.info("  → Explaining MLP with shap.Explainer")
+            expl_mlp = shap.Explainer(lambda X: mlp_model.predict_proba(X), bg)
+            shap_out_mlp = expl_mlp(test_sub)
+            arr_mlp = extract_shap_values(shap_out_mlp)
+            if arr_mlp is not None and arr_mlp.shape == (len(test_sub), len(test_sub.columns)):
+                arr_mlp = arr_mlp[0]
+            if arr_mlp is not None and arr_mlp.ndim == 1:
+                imp_mlp = pd.Series(np.abs(arr_mlp), index=test_sub.columns).sort_values(ascending=False)
+                all_shap_importances["MLP"] = imp_mlp
+            else:
+                log.warning("    MLP SHAP returned unexpected shape; skipping")
+        else:
+            log.warning("    MLP not fitted; skipping SHAP for MLP")
+    except Exception as e:
+        log.error(f"    MLP SHAP failed: {e}")
+        traceback.print_exc()
+
+    # 6.6) TabPFN: shap.Explainer (Kernel)
+    try:
+        if tabpfn_model is not None:
+            log.info("  → Explaining TabPFN with shap.Explainer")
+            expl_tp = shap.Explainer(
+                lambda X: tabpfn_model.predict_proba(X.astype(np.float32)),
+                bg.astype(np.float32)
+            )
+            shap_out_tp = expl_tp(test_sub)
+            arr_tp = extract_shap_values(shap_out_tp)
+            if arr_tp is not None and arr_tp.shape == (len(test_sub), len(test_sub.columns)):
+                arr_tp = arr_tp[0]
+            if arr_tp is not None and arr_tp.ndim == 1:
+                imp_tp = pd.Series(np.abs(arr_tp), index=test_sub.columns).sort_values(ascending=False)
+                all_shap_importances["TabPFN"] = imp_tp
+            else:
+                log.warning("    TabPFN SHAP returned unexpected shape; skipping")
+        else:
+            log.warning("    TabPFN not fitted; skipping SHAP for TabPFN")
+    except Exception as e:
+        log.error(f"    TabPFN SHAP failed: {e}")
+        traceback.print_exc()
+
+    # Log top SHAP feature per model
+    for name, imp_ser in all_shap_importances.items():
+        if not imp_ser.empty:
+            top_feat = imp_ser.index[0]
+            top_val  = imp_ser.iloc[0]
+            log.info(f"    Top SHAP feature for {name}: {top_feat} ({top_val:.4f})")
+        else:
+            log.warning(f"    {name} produced no SHAP importances")
+
+    # 7) Decision Curve Analysis for all models
+    log.info("7) Decision Curve Analysis (DCA) for all models")
+    df_dca = X_test_p.copy()
+    df_dca["status"] = y_test.values
+
+    # Collect predicted probabilities for each baseline (on scaled data)
+    for name, model in fitted_models.items():
+        if model is not None:
+            try:
+                probs = model.predict_proba(X_test_p_scaled)[:, 1]
+                df_dca[name] = probs
+            except Exception:
+                pass
+
+    # TabPFN
+    if tabpfn_model is not None:
+        try:
+            df_dca["TabPFN"] = tabpfn_model.predict_proba(
+                X_test_p.values.astype(np.float32)
+            )[:, 1]
+        except Exception:
+            pass
+
+    modelnames = [n for n in df_dca.columns if n != "status"]
+    try:
+        dca_results = dca(
+            data=df_dca,
+            outcome="status",
+            modelnames=modelnames,
+            thresholds=np.linspace(0.01, 0.99, 50),
+        )
+        log.info(f"    DCA computed for models: {modelnames}")
+    except Exception as e:
+        log.error(f"    DCA failed: {e}")
+        traceback.print_exc()
+
+    # 8) Final performance summary
+    log.info("\n=== FINAL TEST SET PERFORMANCE ===")
+    for name, perf in baseline_perf.items():
+        log.info(f"{name:6s} → AUC: {perf['AUC']:.4f}, F1: {perf['F1']:.4f}")
+
+    total_time = time.time() - t_start
+    log.info(f"\nTotal runtime: {total_time/60:.1f} minutes")
+    log.info("=== PIPELINE COMPLETE ===")
+
+
+if __name__ == "__main__":
+    main()
+
+##SampleResults
+(venv) alexsmacbook@Ryu ~ % python3 ~/merger_pipeline_full.py
+2025-06-04 01:08:49 [INFO] === RQ1–RQ2 LIGHT PIPELINE START ===
+2025-06-04 01:08:49 [INFO] 1) Loading data
+2025-06-04 01:08:50 [INFO] One‐hot encoding 'attitude'
+2025-06-04 01:08:50 [INFO] Data loaded: X.shape=(4400, 36), y.shape=(4400,)
+2025-06-04 01:08:50 [INFO] 2) Train/Val/Test split (70/15/15)
+2025-06-04 01:08:50 [INFO] Train=3080, Val=660, Test=660
+2025-06-04 01:08:50 [INFO] 3) SMOTE + top‐K feature selection
+2025-06-04 01:08:50 [INFO] Top 10 features: ['attitude_Friendly', 'realized_return', 'friendly', 'completion_time', 'attitude_Hostile', 'spread', 'attitude_Neutral', 'historical_avg_completion_time', 'base_equity_value', 'day_premium']
+2025-06-04 01:08:50 [INFO] 4) Training & evaluating tuned baselines (LR, RF, GB, SVM, MLP)
+2025-06-04 01:08:50 [INFO]   → LR: tuning
+2025-06-04 01:08:50 [INFO]     LR → AUC: 0.7171, F1: 0.9239
+2025-06-04 01:08:50 [INFO] LR → Brier: 0.1234, ECE: 0.1372
+2025-06-04 01:08:50 [INFO]   → RF: tuning
+2025-06-04 01:08:50 [INFO]     RF → AUC: 0.8940, F1: 0.9373
+2025-06-04 01:08:50 [INFO] RF → Brier: 0.0811, ECE: 0.0299
+2025-06-04 01:08:50 [INFO]   → GB: tuning
+2025-06-04 01:08:51 [INFO]     GB → AUC: 0.8739, F1: 0.9323
+2025-06-04 01:08:51 [INFO] GB → Brier: 0.0893, ECE: 0.0643
+2025-06-04 01:08:51 [INFO]   → SVM: tuning
+2025-06-04 01:08:51 [INFO]     SVM → AUC: 0.8075, F1: 0.9383
+2025-06-04 01:08:51 [INFO] SVM → Brier: 0.0973, ECE: 0.0781
+2025-06-04 01:08:51 [INFO]   → MLP: tuning
+2025-06-04 01:08:52 [INFO]     MLP → AUC: 0.8233, F1: 0.9330
+2025-06-04 01:08:52 [INFO] MLP → Brier: 0.0984, ECE: 0.0818
+2025-06-04 01:08:52 [INFO] 5) Training TabPFN (max_time=10s)
+2025-06-04 01:08:52 [INFO] Loaded cached TabPFN
+/Users/alexsmacbook/venv/lib/python3.13/site-packages/sklearn/utils/deprecation.py:151: FutureWarning: 'force_all_finite' was renamed to 'ensure_all_finite' in 1.6 and will be removed in 1.8.
+  warnings.warn(
+/Users/alexsmacbook/venv/lib/python3.13/site-packages/sklearn/utils/deprecation.py:151: FutureWarning: 'force_all_finite' was renamed to 'ensure_all_finite' in 1.6 and will be removed in 1.8.
+  warnings.warn(
+/Users/alexsmacbook/venv/lib/python3.13/site-packages/sklearn/base.py:474: FutureWarning: `BaseEstimator._validate_data` is deprecated in 1.6 and will be removed in 1.7. Use `sklearn.utils.validation.validate_data` instead. This function becomes public and is part of the scikit-learn developer API.
+  warnings.warn(
+/Users/alexsmacbook/venv/lib/python3.13/site-packages/sklearn/utils/deprecation.py:151: FutureWarning: 'force_all_finite' was renamed to 'ensure_all_finite' in 1.6 and will be removed in 1.8.
+  warnings.warn(
+2025-06-04 01:11:17 [INFO]     TabPFN → AUC: 0.9168, F1: 0.9379
+2025-06-04 01:11:17 [INFO] TabPFN → Brier: 0.0794, ECE: 0.0676
+2025-06-04 01:11:17 [INFO] 6) RQ2: SHAP feature importances for each model (1 sample each)
+2025-06-04 01:11:17 [INFO]   → Explaining LR with shap.Explainer
+2025-06-04 01:11:17 [INFO]   → Explaining RF with shap.Explainer
+2025-06-04 01:11:17 [INFO]   → Explaining GB with shap.Explainer
+2025-06-04 01:11:17 [INFO]   → Explaining SVM with shap.Explainer
+2025-06-04 01:11:20 [INFO]   → Explaining MLP with shap.Explainer
+2025-06-04 01:11:20 [INFO]   → Explaining TabPFN with shap.Explainer
+/Users/alexsmacbook/venv/lib/python3.13/site-packages/sklearn/utils/deprecation.py:151: FutureWarning: 'force_all_finite' was renamed to 'ensure_all_finite' in 1.6 and will be removed in 1.8.
+  warnings.warn(
+/Users/alexsmacbook/venv/lib/python3.13/site-packages/sklearn/utils/deprecation.py:151: FutureWarning: 'force_all_finite' was renamed to 'ensure_all_finite' in 1.6 and will be removed in 1.8.
+  warnings.warn(
+/Users/alexsmacbook/venv/lib/python3.13/site-packages/sklearn/base.py:474: FutureWarning: `BaseEstimator._validate_data` is deprecated in 1.6 and will be removed in 1.7. Use `sklearn.utils.validation.validate_data` instead. This function becomes public and is part of the scikit-learn developer API.
+  warnings.warn(
+/Users/alexsmacbook/venv/lib/python3.13/site-packages/sklearn/utils/deprecation.py:151: FutureWarning: 'force_all_finite' was renamed to 'ensure_all_finite' in 1.6 and will be removed in 1.8.
+  warnings.warn(
+ExactExplainer explainer: 2it [02:13, 133.88s/it]
+2025-06-04 01:13:34 [INFO]     Top SHAP feature for LR: completion_time (5.1799)
+2025-06-04 01:13:34 [INFO]     Top SHAP feature for RF: day_premium (0.0867)
+2025-06-04 01:13:34 [INFO]     Top SHAP feature for GB: attitude_Friendly (0.0000)
+2025-06-04 01:13:34 [INFO]     Top SHAP feature for SVM: completion_time (0.0000)
+2025-06-04 01:13:34 [INFO]     Top SHAP feature for MLP: realized_return (0.0000)
+2025-06-04 01:13:34 [INFO]     Top SHAP feature for TabPFN: realized_return (0.0394)
+2025-06-04 01:13:34 [INFO] 7) Decision Curve Analysis (DCA) for all models
+/Users/alexsmacbook/venv/lib/python3.13/site-packages/sklearn/utils/deprecation.py:151: FutureWarning: 'force_all_finite' was renamed to 'ensure_all_finite' in 1.6 and will be removed in 1.8.
+  warnings.warn(
+/Users/alexsmacbook/venv/lib/python3.13/site-packages/sklearn/utils/deprecation.py:151: FutureWarning: 'force_all_finite' was renamed to 'ensure_all_finite' in 1.6 and will be removed in 1.8.
+  warnings.warn(
+/Users/alexsmacbook/venv/lib/python3.13/site-packages/sklearn/base.py:474: FutureWarning: `BaseEstimator._validate_data` is deprecated in 1.6 and will be removed in 1.7. Use `sklearn.utils.validation.validate_data` instead. This function becomes public and is part of the scikit-learn developer API.
+  warnings.warn(
+/Users/alexsmacbook/venv/lib/python3.13/site-packages/sklearn/utils/deprecation.py:151: FutureWarning: 'force_all_finite' was renamed to 'ensure_all_finite' in 1.6 and will be removed in 1.8.
+  warnings.warn(
+2025-06-04 01:16:18 [INFO]     DCA computed for models: ['attitude_Friendly', 'realized_return', 'friendly', 'completion_time', 'attitude_Hostile', 'spread', 'attitude_Neutral', 'historical_avg_completion_time', 'base_equity_value', 'day_premium', 'LR', 'RF', 'GB', 'SVM', 'MLP', 'TabPFN']
+2025-06-04 01:16:18 [INFO]
+=== FINAL TEST SET PERFORMANCE ===
+2025-06-04 01:16:18 [INFO] LR     → AUC: 0.7171, F1: 0.9239
+2025-06-04 01:16:18 [INFO] RF     → AUC: 0.8940, F1: 0.9373
+2025-06-04 01:16:18 [INFO] GB     → AUC: 0.8739, F1: 0.9323
+2025-06-04 01:16:18 [INFO] SVM    → AUC: 0.8075, F1: 0.9383
+2025-06-04 01:16:18 [INFO] MLP    → AUC: 0.8233, F1: 0.9330
+2025-06-04 01:16:18 [INFO] TabPFN → AUC: 0.9168, F1: 0.9379
+2025-06-04 01:16:18 [INFO]
+Total runtime: 7.5 minutes
+2025-06-04 01:16:18 [INFO] === PIPELINE COMPLETE ===

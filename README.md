@@ -2,6 +2,8 @@
 
 This repository contains a lightweight pipeline for predicting the outcome of US stock mergers and acquisitions. The code was developed as part of a master thesis at University College Dublin.
 
+The sofware has been utilized a dataset of 4,400 historical U.S. M&A transactions with announcement dates ranging from January 12, 2000, to July 11, 2024, and corresponding exit dates (deal completion or termination) extending from February 14, 2000, to December 26, 2024, characterized by significant class imbalance, as reflected in real life.
+
 The pipeline trains several tuned baseline classifiers together with TabPFN, explains predictions via SHAP, and optionally runs decision curve analysis.
 
 ## Setup

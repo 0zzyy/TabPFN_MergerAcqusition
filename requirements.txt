@@ -1,8 +1,19 @@
-numpy
-pandas
-scikit-learn
-imbalanced-learn
-tabpfn>=2.0
-shap
-dcurves
-joblib
+# Direct (top-level) dependencies, pinned to the exact versions this
+# codebase was implemented and tested against (A8). Installed and
+# verified in a clean virtual environment on 2026-07-15; see
+# requirements.lock for the full transitive dependency closure captured
+# with `pip freeze` in that same environment, and .python-version /
+# pyproject.toml for the pinned Python version.
+#
+# tabpfn==8.1.0 is the version whose default model is TabPFN-3 (Part B).
+# Do not loosen this pin without re-running the full verification
+# protocol in README.md, since TabPFN's API has changed across releases.
+numpy==2.4.6
+pandas==2.3.3
+scikit-learn==1.9.0
+imbalanced-learn==0.14.2
+tabpfn==8.1.0
+shap==0.51.0
+dcurves==1.1.7
+joblib==1.5.3
+pytest==9.1.1

@@ -16,3 +16,15 @@ dist/
 
 # Joblib cache
 cache_light_rq/
+
+# Virtual environments
+.venv/
+venv/
+
+# Pytest cache
+.pytest_cache/
+.cache/
+
+# Packaging
+*.egg-info/
+

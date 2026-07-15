@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mna-pipeline"
+version = "2.0.0"
+description = "M&A outcome prediction pipeline (leakage-safe preprocessing, tuned baselines, TabPFN-3, SHAP, DCA)"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "numpy==2.4.6",
+    "pandas==2.3.3",
+    "scikit-learn==1.9.0",
+    "imbalanced-learn==0.14.2",
+    "tabpfn==8.1.0",
+    "shap==0.51.0",
+    "dcurves==1.1.7",
+    "joblib==1.5.3",
+]
+
+[project.optional-dependencies]
+test = ["pytest==9.1.1"]
+
+[project.scripts]
+mna-pipeline = "mna_pipeline.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
